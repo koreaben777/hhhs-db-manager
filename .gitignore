@@ -1,0 +1,19 @@
+# 접속정보 — 절대 커밋하지 않는다
+.env
+.env.*
+!.env.example
+
+# 로컬 환경
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+openssl-legacy.cnf
+
+# 조회 결과 · 사내 자료
+*.csv
+*.xlsx
+*.parquet
+.DS_Store
