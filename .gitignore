@@ -13,7 +13,8 @@ build/
 dist/
 openssl-legacy.cnf
 
-# 조회 결과 · 사내 자료
+# 조회 결과 · 사내 자료 (테이블 사전 포함)
+테이블사전.md
 *.csv
 *.xlsx
 *.parquet

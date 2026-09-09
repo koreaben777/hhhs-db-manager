@@ -35,6 +35,7 @@ from __future__ import annotations
 __version__ = "0.1.0"
 __all__ = [
     "get_table", "get_list_tables", "get_columns", "query", "check", "engine", "main",
+    "describe", "describe_text", "find_tables", "dict_path", "dict_load", "dict_save", "dict_upsert", "dict_init",
     "DBError", "ConfigError", "QueryRejected", "QueryTimeout", "PermissionDenied",
 ]
 
@@ -526,6 +527,277 @@ def check(verbose: bool = True) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 테이블 사전 · 근거 팩 · 목적 검색
+# LLM 은 부르지 않는다. 판단은 사람 또는 에이전트(Claude Code 등)가 하고, 결과만 사전에 적는다.
+# 사전 파일(markdown 표)은 사내 자료라 저장소에 올리지 않는다 (.gitignore).
+# ---------------------------------------------------------------------------
+DICT_NAME = "테이블사전.md"
+DICT_COLUMNS = ["테이블", "모듈", "한글명", "설명", "근거", "상태", "갱신일"]
+DICT_STATUSES = ("없음", "원본", "LLM추정", "실무확인")
+
+
+def dict_path() -> Path:
+    """사전 파일 위치: HHHS_DICT_FILE → 현재 폴더 → 모듈 폴더(.env 가 있는 작업 사본) 순."""
+    if os.getenv("HHHS_DICT_FILE"):
+        return Path(os.environ["HHHS_DICT_FILE"]).expanduser()
+    for d in (Path.cwd(), _HERE):
+        if (d / DICT_NAME).exists():
+            return d / DICT_NAME
+    return (_HERE if (_HERE / ".env").exists() else Path.cwd()) / DICT_NAME
+
+
+def _md_cell(v) -> str:
+    if v is None or (isinstance(v, float) and v != v):
+        return ""
+    return str(v).replace("|", "｜").replace("\n", " ").strip()
+
+
+def dict_load(path: Path | str | None = None) -> pd.DataFrame:
+    """사전을 DataFrame 으로 읽는다. 파일이 없으면 빈 표."""
+    p = Path(path) if path else dict_path()
+    rows = []
+    if p.exists():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if not line.lstrip().startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if len(cells) != len(DICT_COLUMNS) or cells[0] == DICT_COLUMNS[0] or set(cells[0]) <= set("-: "):
+                continue
+            rows.append(cells)
+    return pd.DataFrame(rows, columns=DICT_COLUMNS)
+
+
+def dict_save(df: pd.DataFrame, path: Path | str | None = None) -> Path:
+    """사전을 markdown 표로 저장한다 (테이블명 순, 중복은 마지막 것)."""
+    p = Path(path) if path else dict_path()
+    df = df.drop_duplicates("테이블", keep="last").sort_values("테이블")
+    n_desc = int((df["설명"].astype(str).str.strip() != "").sum())
+    lines = [
+        "# 한일합섬 ERP 테이블 사전", "",
+        f"- 갱신 {time.strftime('%Y-%m-%d')} · 테이블 {len(df):,}개 · 설명 있음 {n_desc:,}개",
+        "- 상태: `없음` 설명 소스 없음 · `원본` ERP 사전(PIMS_TABLE_INFO)/MS_Description 그대로 · "
+        "`LLM추정` 에이전트가 구조에서 추정(검토 필요) · `실무확인` 담당자 확인",
+        "- 사내 자료. 저장소에 올리지 않는다. 갱신은 `hhhs-db dict add …` (실무확인 행은 덮어쓰지 않음)", "",
+        "| " + " | ".join(DICT_COLUMNS) + " |",
+        "|" + "---|" * len(DICT_COLUMNS),
+    ]
+    for r in df.itertuples(index=False):
+        lines.append("| " + " | ".join(_md_cell(v) for v in r) + " |")
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return p
+
+
+def dict_upsert(table: str, *, desc: str | None = None, name_kr: str | None = None, module: str | None = None,
+                basis: str | None = None, status: str = "LLM추정", force: bool = False) -> dict:
+    """사전에 테이블 한 건을 넣거나 갱신한다. 실무확인 행은 force 없이는 낮은 상태로 덮어쓰지 않는다."""
+    if status not in DICT_STATUSES:
+        raise DBError(f"상태는 {DICT_STATUSES} 중 하나여야 합니다: {status!r}")
+    df = dict_load()
+    key = table.strip().split(".")[-1].upper()
+    hit = df.index[df["테이블"].str.upper() == key]
+    row = df.loc[hit[0]].to_dict() if len(hit) else {c: "" for c in DICT_COLUMNS}
+    if row.get("상태") == "실무확인" and status != "실무확인" and not force:
+        raise DBError(f"{key} 은(는) 실무확인 상태입니다. 덮어쓰려면 --force (force=True).")
+    row["테이블"] = row["테이블"] or key
+    row["모듈"] = row["모듈"] or key.split("_")[0]
+    for k, v in (("설명", desc), ("한글명", name_kr), ("모듈", module), ("근거", basis)):
+        if v is not None:
+            row[k] = v
+    row["상태"] = status
+    row["갱신일"] = time.strftime("%Y-%m-%d")
+    values = [row[c] for c in DICT_COLUMNS]
+    if len(hit):
+        df.loc[hit[0]] = values
+    else:
+        df.loc[len(df)] = values
+    dict_save(df)
+    return row
+
+
+def dict_init(min_rows: int = 1) -> dict:
+    """데이터 있는 테이블 전부를 사전에 등록한다. ERP 사전·MS_Description 이 있으면 한글명을 '원본'으로 채우고,
+    없으면 '없음'으로 둔다. 이미 있는 행은 건드리지 않는다."""
+    live_sql = """
+        WITH live AS (
+            SELECT o.object_id, o.name AS tbl, SUM(p.rows) AS row_cnt
+            FROM sys.objects o JOIN sys.partitions p ON p.object_id = o.object_id AND p.index_id IN (0, 1)
+            WHERE o.type = 'U' GROUP BY o.object_id, o.name HAVING SUM(p.rows) >= :min_rows)
+        SELECT l.tbl AS [table], l.row_cnt,
+               (SELECT TOP 1 CAST(value AS nvarchar(400)) FROM sys.extended_properties ep
+                 WHERE ep.major_id = l.object_id AND ep.minor_id = 0 AND ep.name = 'MS_Description') AS ms_desc{pims_cols}
+        FROM live l{pims_join} ORDER BY l.tbl"""
+    pims = dict(
+        pims_cols=", LTRIM(RTRIM(i.[설명])) AS pims_desc, LTRIM(RTRIM(i.[모듈])) AS pims_module",
+        pims_join=" LEFT JOIN (SELECT [테이블명], MAX([설명]) AS [설명], MAX([모듈]) AS [모듈] FROM [dbo].[PIMS_TABLE_INFO] GROUP BY [테이블명]) i ON i.[테이블명] = l.tbl",
+    )
+    try:
+        src = query(live_sql.format(**pims), min_rows=min_rows, max_rows=0, allow_heavy=True)
+    except DBError:   # PIMS_TABLE_INFO 권한이 없는 계정
+        src = query(live_sql.format(pims_cols="", pims_join=""), min_rows=min_rows, max_rows=0, allow_heavy=True)
+        src["pims_desc"] = None
+        src["pims_module"] = None
+    df = dict_load()
+    known = set(df["테이블"].str.upper())
+    added = {"원본": 0, "없음": 0}
+    today = time.strftime("%Y-%m-%d")
+    for r in src.itertuples(index=False):
+        if r.table.upper() in known:
+            continue
+        name_kr = (r.pims_desc or r.ms_desc or "") if isinstance(r.pims_desc, str) or isinstance(r.ms_desc, str) else ""
+        basis = "PIMS_TABLE_INFO" if isinstance(r.pims_desc, str) and r.pims_desc else ("MS_Description" if isinstance(r.ms_desc, str) and r.ms_desc else "")
+        status = "원본" if name_kr else "없음"
+        module = r.pims_module if isinstance(r.pims_module, str) and r.pims_module else r.table.split("_")[0]
+        df.loc[len(df)] = [r.table, module, name_kr, "", basis, status, today]
+        added[status] += 1
+    path = dict_save(df)
+    return {"path": str(path), "total": int(len(df)), "added_원본": added["원본"], "added_없음": added["없음"],
+            "설명_없는_테이블": int((df["설명"].astype(str).str.strip() == "").sum())}
+
+
+def describe(table_name: str, sample: int = 0) -> dict:
+    """테이블이 무엇인지 판단하기 위한 근거 팩. LLM 을 부르지 않는다 — 판단은 사람·에이전트가 한다.
+
+    포함: ERP 사전(PIMS_TABLE_INFO) · MS_Description · 컬럼 한글명(CM_DICTION) · PK · 행수 ·
+          같은 이름줄기의 이웃 테이블(HEAD/LINE 짝 등) · 이름이 닮은 ERP 화면 · 사전의 현재 항목 · (선택) 샘플 행
+    """
+    schema, tbl = _split_name(table_name)
+    cat = get_list_tables(schema=schema)
+    hit = cat[cat["table"].str.upper() == tbl.upper()]
+    if hit.empty:
+        raise DBError(f"테이블이 없습니다: {schema}.{tbl} — get_list_tables('{tbl[:6]}') 로 이름을 확인하세요.")
+    meta = hit.iloc[0]
+    tbl = str(meta["table"])
+    full = f"{schema}.{tbl}"
+    cols = get_columns(full)
+    ms_desc = None
+    try:
+        ms_cols = query("""
+            SELECT c.name AS [column], CAST(ep.value AS nvarchar(200)) AS ms_desc
+            FROM sys.extended_properties ep JOIN sys.columns c ON c.object_id = ep.major_id AND c.column_id = ep.minor_id
+            WHERE ep.name = 'MS_Description' AND ep.major_id = OBJECT_ID(:full)""", full=full, allow_heavy=True)
+        if not ms_cols.empty:
+            cols = cols.merge(ms_cols, on="column", how="left")
+        ms_tbl = query("SELECT CAST(value AS nvarchar(400)) AS d FROM sys.extended_properties "
+                       "WHERE name = 'MS_Description' AND minor_id = 0 AND major_id = OBJECT_ID(:full)", full=full, allow_heavy=True)
+        ms_desc = str(ms_tbl.iloc[0, 0]) if len(ms_tbl) else None
+    except DBError:
+        pass
+    if "ms_desc" not in cols.columns:
+        cols["ms_desc"] = None
+    pims = {}
+    try:
+        pf = query("SELECT TOP 1 [설명] AS d, [모듈] AS m, [구분] AS g, [사용여부] AS u, [비고] AS r "
+                   "FROM [dbo].[PIMS_TABLE_INFO] WHERE [테이블명] = :t", t=tbl, allow_heavy=True)
+        pims = {k: (None if pd.isna(v) else str(v).strip()) for k, v in pf.iloc[0].items()} if len(pf) else {}
+    except DBError:
+        pass
+    prefix = tbl.split("_")[0]
+    base = re.sub(r"(?:H|L|_LOG|_HST|_\d{6,8}|_BAK|_MABAK)$", "", tbl, flags=re.I)   # SA_SOH → SA_SO
+    neighbors = cat[cat["table"].str.upper().str.startswith(base.upper()) & (cat["table"] != tbl)][["table", "rows"]].head(15)
+    core = re.sub(r"^[A-Z0-9]+_", "", base)                                          # SO / Z_HISF_WO_PR
+    screens = pd.DataFrame(columns=["ID_MENU", "NM_KR"])
+    if len(core) >= 3:
+        pat = "P[_]" + prefix + "[_]%" + core.replace("_", "[_]") + "%"
+        try:
+            screens = query(f"SELECT TOP 12 ID_MENU, NM_KR FROM [{SCHEMA}].[MA_N_BASEMENU] "
+                            "WHERE YN_USE = 'Y' AND FG_TYPE <> 'MEN' AND ID_MENU LIKE :p ORDER BY ID_MENU", p=pat, allow_heavy=True)
+        except DBError:
+            pass
+    d = dict_load()
+    ex = d[d["테이블"].str.upper() == tbl.upper()]
+    return {
+        "table": full, "module": prefix, "custom": "_Z_HISF_" in tbl.upper(),
+        "rows": int(meta["rows"]), "columns": int(meta["columns"]), "modified": str(meta["modified"]),
+        "pims": pims, "ms_description": ms_desc,
+        "dictionary": ex.iloc[0].to_dict() if len(ex) else None,
+        "pk": cols[cols["pk"].notna()].sort_values("pk")["column"].tolist(),
+        "columns_detail": cols, "neighbors": neighbors, "screens": screens,
+        "sample": get_table(full, sample) if sample else None,
+    }
+
+
+def describe_text(info: dict) -> str:
+    """describe() 결과를 사람·에이전트가 읽는 텍스트로."""
+    nz = lambda v: "" if v is None or (isinstance(v, float) and v != v) else str(v)
+    L = [f"# {info['table']}  —  {'커스텀(Z_HISF) · ' if info['custom'] else ''}모듈 {info['module']} · "
+         f"{info['rows']:,}행 · {info['columns']}열 · 최종 수정 {info['modified']}"]
+    p = info["pims"]
+    L.append("ERP 사전(PIMS_TABLE_INFO): " + (f"{p.get('d') or '(설명 없음)'} · 모듈 {p.get('m')} · 구분 {p.get('g')} · 사용여부 {p.get('u')}"
+                                           + (f" · 비고 {p['r']}" if p.get("r") else "") if p else "항목 없음"))
+    L.append(f"MS_Description: {info['ms_description'] or '없음'}")
+    d = info["dictionary"]
+    L.append("사전 현재 항목: " + (f"[{d['상태']}] 한글명 '{d['한글명']}' · 설명 '{d['설명']}'" if d else "없음 (hhhs-db dict init 을 먼저 실행하면 원본 정보가 채워짐)"))
+    L.append(f"PK: {' + '.join(info['pk']) or '없음'}")
+    L.append(f"\n## 컬럼 {info['columns']}개  (컬럼 · 한글명 · 자료형 · MS_Description)")
+    for r in info["columns_detail"].itertuples(index=False):
+        L.append(f"  {r.column:<24} {nz(getattr(r, 'name_kr', '')):<18} {nz(r.type):<16} {nz(getattr(r, 'ms_desc', ''))}".rstrip())
+    L.append("\n## 같은 이름줄기의 테이블 (HEAD/LINE 짝 · 로그 · 백업)")
+    L += [f"  {r.table:<32} {int(r.rows):>12,}행" for r in info["neighbors"].itertuples(index=False)] or ["  없음"]
+    L.append("\n## 이름이 닮은 ERP 화면 (MA_N_BASEMENU)")
+    L += [f"  {r.ID_MENU:<36} {r.NM_KR}" for r in info["screens"].itertuples(index=False)] or ["  없음"]
+    if info.get("sample") is not None:
+        L.append(f"\n## 샘플 {len(info['sample'])}행")
+        L.append(info["sample"].to_string(index=False, max_colwidth=24))
+    L.append("\n## 판단 지침")
+    L.append("  위 근거로 이 테이블이 어떤 업무 데이터를 어떤 단위(전표·라인·롤·일자…)로 담는지 2~3문장으로 쓴다.")
+    L.append("  근거는 컬럼 한글명·PK·이웃 테이블·화면 이름에서만 가져오고, 추측한 부분은 '추정'이라고 적는다.")
+    L.append(f"  기록: hhhs-db dict add {info['table'].split('.')[-1]} --name-kr \"짧은 한글명\" --desc \"설명\" --basis \"근거\"   (상태 LLM추정)")
+    return "\n".join(L)
+
+
+@lru_cache(maxsize=1)
+def _column_names_kr() -> pd.DataFrame:
+    """데이터 있는 테이블의 (테이블, 컬럼, 한글명). 목적 검색용 — 프로세스당 한 번 읽는다."""
+    return query(f"""
+        SELECT c.TABLE_NAME AS [table], c.COLUMN_NAME AS [column], d.NM_KR AS name_kr
+        FROM INFORMATION_SCHEMA.COLUMNS c
+        JOIN (SELECT CD_SYSTEM, MIN(NM_KR) AS NM_KR FROM [{SCHEMA}].CM_DICTION GROUP BY CD_SYSTEM) d ON d.CD_SYSTEM = c.COLUMN_NAME
+        JOIN (SELECT o.name FROM sys.objects o JOIN sys.partitions p ON p.object_id = o.object_id AND p.index_id IN (0, 1)
+              WHERE o.type = 'U' GROUP BY o.name HAVING SUM(p.rows) > 0) l ON l.name = c.TABLE_NAME
+        WHERE c.TABLE_SCHEMA = :s""", s=SCHEMA, max_rows=0, allow_heavy=True)
+
+
+def find_tables(purpose: str, limit: int = 20) -> pd.DataFrame:
+    """목적·키워드로 테이블 후보를 찾는다 (LLM 없음). 사전의 한글명·설명, 테이블 이름, 컬럼 한글명을 대조해 점수를 매긴다.
+
+    예: find_tables("수주 납기"), find_tables("롤 폭 길이"), find_tables("거래처 여신")
+    결과의 '근거' 열에 어떤 항목이 맞았는지 나오므로, 후보를 좁힌 뒤 describe() 로 확인한다.
+    """
+    tokens = [t for t in re.split(r"[\s,/·+&()\[\]]+", purpose.strip()) if len(t) >= 2]
+    if not tokens:
+        raise DBError("두 글자 이상의 키워드를 넣으세요. 예: find_tables('수주 납기')")
+    cat = get_list_tables(min_rows=1)
+    d = dict_load().set_index(dict_load()["테이블"].str.upper()) if not dict_load().empty else pd.DataFrame(columns=DICT_COLUMNS)
+    colkr = _column_names_kr()
+    col_hits: dict[str, list[str]] = {}
+    for t in tokens:
+        m = colkr[colkr["name_kr"].str.contains(t, regex=False, na=False)]
+        for r in m.itertuples(index=False):
+            col_hits.setdefault(r.table.upper(), []).append(f"{r.column}={r.name_kr}")
+    rows = []
+    for r in cat.itertuples(index=False):
+        key = r.table.upper()
+        name_kr = str(d.at[key, "한글명"]) if key in d.index else ""
+        desc = str(d.at[key, "설명"]) if key in d.index else ""
+        score, why = 0, []
+        for t in tokens:
+            if t.upper() in key:
+                score += 3; why.append(f"이름:{t}")
+            if t in name_kr:
+                score += 5; why.append(f"한글명:{t}")
+            if t in desc:
+                score += 4; why.append(f"설명:{t}")
+        hits = col_hits.get(key, [])
+        if hits:
+            score += min(len(hits), 5)
+            why.append("컬럼:" + ", ".join(hits[:4]) + (" …" if len(hits) > 4 else ""))
+        if score:
+            rows.append((r.table, name_kr, desc[:60], score, "; ".join(why), int(r.rows)))
+    out = pd.DataFrame(rows, columns=["table", "한글명", "설명", "score", "근거", "rows"])
+    return out.sort_values(["score", "rows"], ascending=[False, False]).head(limit).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
@@ -553,6 +825,27 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("query", help="SELECT 실행. SQL 문자열 또는 '-' (stdin)")
     s.add_argument("sql")
     s.add_argument("--allow-heavy", action="store_true", help="큰 테이블 전체 조회 허용")
+    s = sub.add_parser("describe", help="테이블이 무엇인지 판단할 근거 팩. 예: hhhs-db describe PR_Z_HISF_BCR_PR")
+    s.add_argument("table")
+    s.add_argument("--sample", type=int, default=0, help="샘플 행 수 (기본 0 = 구조만)")
+    s = sub.add_parser("find", help="목적·키워드로 테이블 후보 찾기. 예: hhhs-db find \"수주 납기\"")
+    s.add_argument("purpose")
+    s.add_argument("-n", "--limit", type=int, default=20)
+    s = sub.add_parser("dict", help="테이블 사전 (테이블사전.md). init · show · add")
+    ds = s.add_subparsers(dest="dict_cmd", required=True)
+    ds.add_parser("init", help="데이터 있는 테이블 전부 등록 + ERP 사전/MS_Description 으로 한글명 채움 (기존 행 유지)")
+    x = ds.add_parser("show", help="사전 보기. 예: hhhs-db dict show 수주 / --missing / --status 없음")
+    x.add_argument("keyword", nargs="?", help="테이블명 · 한글명 · 설명에 포함된 문자열")
+    x.add_argument("--missing", action="store_true", help="설명이 비어 있는 것만")
+    x.add_argument("--status", choices=DICT_STATUSES)
+    x = ds.add_parser("add", help="설명 기록. 예: hhhs-db dict add SA_SOH --name-kr 수주HEAD --desc \"…\" --basis \"컬럼 NO_SO…\"")
+    x.add_argument("table")
+    x.add_argument("--desc", help="2~3문장 설명")
+    x.add_argument("--name-kr", help="짧은 한글명")
+    x.add_argument("--module", help="모듈 (비우면 접두사)")
+    x.add_argument("--basis", help="근거 (어느 컬럼·화면·문서를 보고 판단했는지)")
+    x.add_argument("--status", choices=DICT_STATUSES, default="LLM추정")
+    x.add_argument("--force", action="store_true", help="실무확인 행도 덮어쓴다")
     a = p.parse_args(argv)
 
     if a.verbose:
@@ -561,7 +854,32 @@ def main(argv: list[str] | None = None) -> int:
         if a.cmd == "check":
             check()
             return 0
-        if a.cmd == "tables":
+        if a.cmd == "describe":
+            print(describe_text(describe(a.table, sample=a.sample)))
+            return 0
+        if a.cmd == "dict":
+            if a.dict_cmd == "init":
+                r = dict_init()
+                print(f"사전 {r['path']}: 테이블 {r['total']:,}개 (이번에 원본 {r['added_원본']}개 · 없음 {r['added_없음']}개 추가) · 설명 비어 있음 {r['설명_없는_테이블']:,}개")
+                return 0
+            if a.dict_cmd == "add":
+                row = dict_upsert(a.table, desc=a.desc, name_kr=a.name_kr, module=a.module, basis=a.basis, status=a.status, force=a.force)
+                print(f"기록: {row['테이블']} [{row['상태']}] {row['한글명']} — {row['설명']}  → {dict_path()}")
+                return 0
+            df = dict_load()
+            if df.empty:
+                print(f"사전이 비어 있습니다 ({dict_path()}). 먼저 hhhs-db dict init", file=sys.stderr)
+                return 1
+            if a.keyword:
+                k = a.keyword
+                df = df[df["테이블"].str.contains(k, case=False, regex=False) | df["한글명"].str.contains(k, regex=False) | df["설명"].str.contains(k, regex=False)]
+            if a.missing:
+                df = df[df["설명"].str.strip() == ""]
+            if a.status:
+                df = df[df["상태"] == a.status]
+        elif a.cmd == "find":
+            df = find_tables(a.purpose, limit=a.limit)
+        elif a.cmd == "tables":
             df = get_list_tables(a.like, min_rows=a.min_rows, schema=a.schema)
         elif a.cmd == "columns":
             df = get_columns(a.table)

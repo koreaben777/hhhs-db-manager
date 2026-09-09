@@ -3,6 +3,7 @@
 실행: .venv/bin/python3 -m unittest -v
 """
 import ast
+import tempfile
 import json
 import os
 from pathlib import Path
@@ -146,6 +147,43 @@ class OfflineTests(unittest.TestCase):
                 ns["full_name"](value)
         with patch("builtins.input", side_effect=["-1", "abc", "10001", "20"]), patch("builtins.print"):
             self.assertEqual(ns["ask_limit"](), 20)
+
+
+class DictionaryTests(unittest.TestCase):
+    """테이블 사전(markdown 표) — DB 없이 임시 파일로 검증."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = patch.dict(os.environ, {"HHHS_DICT_FILE": str(Path(self.tmp.name) / "테이블사전.md")})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_roundtrip_escaping_and_update(self):
+        db.dict_upsert("sa_soh", name_kr="수주 HEAD", desc="파이프|와 줄바꿈\n포함", basis="컬럼 NO_SO", status="원본")
+        df = db.dict_load()
+        self.assertEqual(df.loc[0, "테이블"], "SA_SOH")
+        self.assertEqual(df.loc[0, "모듈"], "SA")
+        self.assertIn("｜", df.loc[0, "설명"])
+        self.assertNotIn("\n", df.loc[0, "설명"])
+        db.dict_upsert("SA_SOH", desc="갱신", status="LLM추정")
+        df = db.dict_load()
+        self.assertEqual(len(df), 1)
+        self.assertEqual(df.loc[0, "설명"], "갱신")
+        self.assertEqual(df.loc[0, "한글명"], "수주 HEAD")   # 안 준 항목은 유지
+        self.assertTrue(db.dict_path().read_text(encoding="utf-8").startswith("# 한일합섬 ERP 테이블 사전"))
+
+    def test_confirmed_rows_are_protected(self):
+        db.dict_upsert("PR_WO", desc="확인됨", status="실무확인")
+        with self.assertRaises(db.DBError):
+            db.dict_upsert("PR_WO", desc="추정", status="LLM추정")
+        db.dict_upsert("PR_WO", desc="추정", status="LLM추정", force=True)
+        self.assertEqual(db.dict_load().loc[0, "설명"], "추정")
+        with self.assertRaises(db.DBError):
+            db.dict_upsert("PR_WO", status="이상한상태")
+        self.assertTrue(db.dict_load(Path(self.tmp.name) / "없는파일.md").empty)
 
 
 if __name__ == "__main__":
