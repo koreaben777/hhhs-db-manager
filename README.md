@@ -103,7 +103,9 @@ DB_NAME=NEOE
 
 ### 노트북으로 (에이전트 없이 쓸 때)
 
-`탐색_노트북.ipynb` 를 열어 위에서부터 실행하면 됩니다 — 접속 확인 → 테이블 찾기 → 컬럼 → 미리보기 → 자유 SQL → 집계 → 코드값 뜻 → 저장 순서로 예시가 들어 있고, 테이블명 · 조건만 바꿔 쓰면 됩니다.
+`hhhs_db_manager.ipynb` 는 입력창으로 조건을 받아 조회하는 **DB 검색기** 형태입니다. 셀을 실행하면 테이블명 · 컬럼 · 조건 · 정렬 · 건수 등을 물어보고, 비워 두면 기본값으로 실행됩니다.
+
+접속 확인 → 테이블 찾기 → 컬럼 보기(한글명) → 데이터 조회 → 값으로 찾기 → 값별 건수 → 자유 SQL → 코드값 뜻 → 저장 순서이며, 결과는 항상 `df` 에 남아 마지막 절에서 파일로 저장할 수 있습니다.
 
 ```bash
 uv pip install -e ".[notebook]"     # 커널(ipykernel) 포함 설치. 이후 VS Code · Jupyter 에서 .venv 커널 선택
@@ -328,7 +330,7 @@ cp .env.example .env            # 값 채우기
 hhhs-db check                   # 접속 · 권한 · 설정
 ```
 
-- 코드는 `hhhs_db_manager.py` 한 파일, 사람용 예시는 `탐색_노트북.ipynb` 입니다. 접속 → `query()` 한 곳을 모든 조회가 지나가므로 부하 장치는 거기에만 있습니다.
+- 코드는 `hhhs_db_manager.py` 한 파일, 사람용 예시는 `hhhs_db_manager.ipynb` 입니다. 접속 → `query()` 한 곳을 모든 조회가 지나가므로 부하 장치는 거기에만 있습니다.
 - `db.py` 는 이전 이름으로 부르던 스크립트를 위한 호환 파일입니다. 새 코드에서는 쓰지 마세요.
 - TLS 설정(`openssl-legacy.cnf`)은 모듈 안에 내장되어 첫 실행 때 `~/.cache/hhhs_db_manager/` 에 풀립니다. 서버 인증서가 갱신되면 이 부분을 지우면 됩니다.
 - 변경 후에는 `hhhs-db check`, `hhhs-db tables SO`, `hhhs-db table SA_SOH -n 3` 세 가지가 돌아가는지 확인하고 커밋합니다.
