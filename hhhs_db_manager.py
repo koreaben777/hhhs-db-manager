@@ -126,7 +126,10 @@ class PermissionDenied(DBError):
 # 접속
 # ---------------------------------------------------------------------------
 def _load_env() -> Path | None:
-    for cand in (os.getenv("HHHS_ENV_FILE"), Path.cwd() / ".env", _HERE / ".env"):
+    explicit = os.getenv("HHHS_ENV_FILE")
+    if explicit and not Path(explicit).is_file():
+        raise ConfigError("HHHS_ENV_FILE 경로에 파일이 없습니다. 경로를 확인하세요.")
+    for cand in (explicit, Path.cwd() / ".env", _HERE / ".env"):
         if cand and Path(cand).is_file():
             load_dotenv(cand, override=False)   # 이미 있는 환경변수가 우선
             return Path(cand)
@@ -174,15 +177,76 @@ def engine():
 # ---------------------------------------------------------------------------
 # 쿼리 실행 — 부하 장치는 전부 여기를 지난다
 # ---------------------------------------------------------------------------
-_SELECT_RE = re.compile(r"^\s*(?:(?:--[^\n]*\n|/\*.*?\*/)\s*)*(?:SELECT|WITH)\b", re.I | re.S)
 _TABLE_RE = re.compile(r"\b(?:FROM|JOIN)\s+(?:\[?\w+\]?\.)?\[?(\w+)\]?", re.I)
 _LIGHT_RE = re.compile(r"\bTOP\b|\bWHERE\b|\bGROUP\s+BY\b|\b(?:COUNT|SUM|MIN|MAX|AVG)\s*\(", re.I)
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 
 
+def _sql_code(sql: str) -> str:
+    """검사용 SQL: 문자열·인용 식별자·주석은 공백 처리 (중첩 주석 포함)."""
+    out = []
+    i = 0
+    while i < len(sql):
+        if sql.startswith("--", i):
+            end = sql.find("\n", i)
+            i = len(sql) if end < 0 else end
+            out.append(" ")
+        elif sql.startswith("/*", i):
+            depth = 1
+            i += 2
+            while i < len(sql) and depth:
+                if sql.startswith("/*", i):
+                    depth += 1
+                    i += 2
+                elif sql.startswith("*/", i):
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            if depth:
+                raise QueryRejected("닫히지 않은 SQL 주석입니다.")
+            out.append(" ")
+        elif sql[i] in "'\"[":
+            endchar = "]" if sql[i] == "[" else sql[i]
+            i += 1
+            while i < len(sql):
+                if sql[i] == endchar:
+                    i += 1
+                    if i < len(sql) and sql[i] == endchar:
+                        i += 1
+                        continue
+                    break
+                i += 1
+            else:
+                raise QueryRejected("닫히지 않은 SQL 문자열 또는 식별자입니다.")
+            out.append(" quoted_token ")
+        else:
+            out.append(sql[i])
+            i += 1
+    return "".join(out)
+
+
+def _validate_read_only(sql: str) -> None:
+    code = _sql_code(sql).strip()
+    if not re.match(r"^(SELECT|WITH)\b", code, re.I):
+        raise QueryRejected("SELECT / WITH 로 시작하는 조회만 실행합니다.")
+    if ";" in (code[:-1] if code.endswith(";") else code):
+        raise QueryRejected("SQL 문장은 한 번에 하나만 실행하세요.")
+    if re.search(r"\bNEXT\s+VALUE\s+FOR\b", code, re.I):
+        raise QueryRejected("시퀀스 값을 변경하는 조회는 허용하지 않습니다.")
+    if re.search(r"\b(INSERT|UPDATE|DELETE|MERGE|INTO|EXEC|EXECUTE|CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE|DENY|BACKUP|RESTORE|DBCC|WAITFOR|USE|SET|OPENROWSET|OPENQUERY|OPENDATASOURCE)\b", code, re.I):
+        raise QueryRejected("읽기 전용 SELECT만 허용합니다. 쓰기·실행·외부 접근 구문은 사용할 수 없습니다.")
+
+
+def _row_limit(value, name: str, *, allow_zero: bool = True) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < (0 if allow_zero else 1):
+        raise QueryRejected(f"{name} 은(는) {'0 이상의' if allow_zero else '양의'} 정수여야 합니다.")
+    return value
+
+
 def _reject_if_heavy(sql: str) -> None:
     """100만 행 이상 테이블을 TOP·WHERE·집계 없이 읽는 SQL 은 실행 전에 막는다."""
-    if _LIGHT_RE.search(sql):
+    if _LIGHT_RE.search(_sql_code(sql)):
         return
     big = set(get_list_tables(min_rows=HEAVY_ROWS)["table"].str.upper())
     hit = sorted({t for t in _TABLE_RE.findall(sql) if t.upper() in big})
@@ -223,7 +287,7 @@ def _translate(e: BaseException, sql: str) -> DBError:
             "(정말 오래 걸리는 집계면 환경변수 HHHS_QUERY_TIMEOUT 을 올려서 실행)"
         )
     if "permission was denied" in low:
-        return PermissionDenied("SELECT 권한이 없는 테이블입니다. 테이블 이름을 적어 권한 추가를 요청하세요. " + msg)
+        return PermissionDenied("SELECT 권한이 없는 테이블입니다. 테이블 이름을 적어 권한 추가를 요청하세요.")
     m = re.search(r"Invalid object name '([^']+)'", msg)
     if m:
         return DBError(f"테이블이 없습니다: {m.group(1)} — get_list_tables('{m.group(1).split('.')[-1][:6]}') 로 이름을 확인하세요.")
@@ -238,7 +302,7 @@ def _translate(e: BaseException, sql: str) -> DBError:
         return DBError("서버에 닿지 못했습니다. 네트워크 · 방화벽(IP 허용목록)을 확인하세요.")
     if "lock request time out" in low or "1222" in msg:
         return DBError(f"다른 작업이 잠근 행을 {LOCK_TIMEOUT_MS // 1000}초 기다리다 포기했습니다. 잠시 후 다시 시도하세요.")
-    return DBError(msg)
+    return DBError("DB 조회에 실패했습니다. SQL 구문·바인딩 값·연결 상태를 확인하세요. 원본 오류는 접속정보 보호를 위해 표시하지 않습니다.")
 
 
 def _run(sql: str, params: dict, max_rows: int) -> pd.DataFrame:
@@ -248,11 +312,11 @@ def _run(sql: str, params: dict, max_rows: int) -> pd.DataFrame:
                 res = conn.execute(text(sql), params)
                 rows = res.fetchmany(max_rows + 1) if max_rows else res.fetchall()
                 cols = list(res.keys())
-                res.close()                      # 남은 결과는 받지 않는다 → 서버 전송 중단
+                res.close()                      # 결과 닫기. 서버 스캔량·드라이버 버퍼링 상한은 아님
             break
         except DBAPIError as e:
             if attempt == 1 and _is_transient(e):
-                log.warning("연결이 끊겨 2초 후 재시도합니다: %s", _short(e))
+                log.warning("연결이 끊겨 2초 후 재시도합니다.")
                 engine().dispose()
                 time.sleep(2)
                 continue
@@ -277,9 +341,8 @@ def query(sql: str, params: dict | None = None, *, max_rows: int | None = None,
     allow_heavy 100만 행 이상 테이블을 조건 없이 읽는 것을 허용.
     """
     params = {**(params or {}), **kw}
-    max_rows = MAX_ROWS if max_rows is None else int(max_rows)
-    if not _SELECT_RE.match(sql):
-        raise QueryRejected("SELECT / WITH 로 시작하는 조회만 실행합니다.")
+    max_rows = _row_limit(MAX_ROWS if max_rows is None else max_rows, "max_rows")
+    _validate_read_only(sql)
     if not allow_heavy:
         _reject_if_heavy(sql)
     with _lock:
@@ -373,7 +436,9 @@ def get_columns(table_name: str) -> pd.DataFrame:
         LEFT JOIN (SELECT kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.COLUMN_NAME, kcu.ORDINAL_POSITION
                    FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
                    JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-                     ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY') k
+                     ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+                     AND tc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA
+                     AND tc.TABLE_NAME = kcu.TABLE_NAME AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY') k
           ON k.TABLE_SCHEMA = c.TABLE_SCHEMA AND k.TABLE_NAME = c.TABLE_NAME AND k.COLUMN_NAME = c.COLUMN_NAME
         {dict_join}
         WHERE c.TABLE_SCHEMA = :s AND c.TABLE_NAME = :t
@@ -385,8 +450,10 @@ def get_columns(table_name: str) -> pd.DataFrame:
     )
     try:
         df = query(base.format(**with_dict), s=schema, t=tbl, allow_heavy=True)
-    except DBError:
-        df = query(base.format(name_kr="", dict_join=""), s=schema, t=tbl, allow_heavy=True)
+    except DBError as exc:
+        if isinstance(exc, (QueryTimeout, ConfigError)):
+            raise
+        df = query(base.format(name_kr="CAST(NULL AS nvarchar(200)) AS name_kr,", dict_join=""), s=schema, t=tbl, allow_heavy=True)
     if df.empty:
         raise DBError(f"테이블이 없습니다: {schema}.{tbl} — get_list_tables('{tbl[:6]}') 로 이름을 확인하세요.")
     df["pk"] = df["pk"].astype("Int64")   # 1, 2, … / <NA>
@@ -394,7 +461,8 @@ def get_columns(table_name: str) -> pd.DataFrame:
 
 
 def get_table(table_name: str, limit: int | None = 100, *, columns: list[str] | None = None,
-              where: str | None = None, order_by: str | None = None, **params) -> pd.DataFrame:
+              where: str | None = None, order_by: str | None = None,
+              max_rows: int | None = None, **params) -> pd.DataFrame:
     """테이블을 읽는다.  SELECT TOP {limit} {columns} FROM {table} WHERE {where} ORDER BY {order_by}
 
     limit     기본 100. None 이면 TOP 없이 — 큰 테이블은 where 가 없으면 거부된다
@@ -410,6 +478,8 @@ def get_table(table_name: str, limit: int | None = 100, *, columns: list[str] | 
         cols = ", ".join(f"[{c}]" for c in columns)
     else:
         cols = "*"
+    if limit is not None:
+        _row_limit(limit, "limit", allow_zero=False)
     sql = f"SELECT {'TOP (' + str(int(limit)) + ') ' if limit else ''}{cols} FROM [{schema}].[{tbl}]"
     if where:
         sql += f" WHERE {where}"
@@ -417,7 +487,7 @@ def get_table(table_name: str, limit: int | None = 100, *, columns: list[str] | 
         if not re.fullmatch(r"[\w\[\]\s,]+", order_by):
             raise QueryRejected(f"order_by 는 컬럼명과 ASC/DESC 만 허용합니다: {order_by!r}")
         sql += f" ORDER BY {order_by}"
-    return query(sql, params, max_rows=int(limit) if limit else None)
+    return query(sql, params, max_rows=max_rows)
 
 
 def check(verbose: bool = True) -> dict:
@@ -497,7 +567,7 @@ def main(argv: list[str] | None = None) -> int:
             df = get_columns(a.table)
         elif a.cmd == "table":
             cols = [c.strip() for c in a.columns.split(",")] if a.columns else None
-            df = get_table(a.table, a.limit or None, columns=cols, where=a.where, order_by=a.order_by)
+            df = get_table(a.table, a.limit or None, columns=cols, where=a.where, order_by=a.order_by, max_rows=a.max_rows)
         else:
             sql = sys.stdin.read() if a.sql == "-" else a.sql
             df = query(sql, max_rows=a.max_rows, allow_heavy=a.allow_heavy)

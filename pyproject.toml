@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-notebook = ["ipykernel>=6"]
+notebook = ["ipykernel>=6", "jupyterlab>=4", "openpyxl>=3.1"]
 
 [project.scripts]
 hhhs-db = "hhhs_db_manager:main"

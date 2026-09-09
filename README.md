@@ -111,6 +111,37 @@ DB_NAME=NEOE
 uv pip install -e ".[notebook]"     # 커널(ipykernel) 포함 설치. 이후 VS Code · Jupyter 에서 .venv 커널 선택
 ```
 
+### 노트북 실행 환경과 사용 순서
+
+저장소 폴더에서 설치합니다. `.env`가 이미 있으면 복사 명령으로 덮어쓰지 마세요.
+
+```bash
+uv venv --python 3.13                 # .venv가 없는 경우에만
+uv pip install -e ".[notebook]"       # ipykernel + JupyterLab + Excel 저장 엔진
+uv run jupyter lab hhhs_db_manager.ipynb
+```
+
+VS Code에서는 노트북 우측 상단 **커널 선택 → Python 환경 → 이 저장소의 .venv**를 선택하세요.
+Jupyter에서 커널을 찾지 못하면 다음 명령으로 등록할 수 있습니다.
+
+```bash
+uv run python3 -m ipykernel install --user --name hhhs-db --display-name "Python (hhhs-db)"
+```
+
+1. **0절**을 먼저 실행합니다. 이후 필요한 절만 `Shift+Enter`로 실행하세요. `모두 실행`은 권장하지 않습니다.
+2. **1절 테이블 → 2절 컬럼 → 3절 미리보기** 순서로 확인합니다. 입력창을 비우면 기본값이 사용됩니다.
+3. **4절**은 입력값을 SQL 바인딩으로 전달합니다. **3·5절 WHERE와 6절 SQL은 직접 작성하는 SQL**이므로 검토 후 실행하세요.
+4. 건수 입력은 1~10,000만 허용합니다. TOP은 결과 행수 제한이지 스캔 비용 제한이 아닙니다. **5절 분포 집계도 기간 조건을 권장**합니다.
+5. 실패하거나 취소하면 `df`를 비워 이전 결과의 잘못된 저장을 방지합니다. **8절**은 파일명만 받고 기존 파일은 덮어쓰지 않습니다.
+6. 결과는 출력한 저장 폴더(프로젝트 루트)에 보관합니다. `DB조회도구` 폴더에서 실행하면 상위 프로젝트 폴더입니다. 상위 폴더는 이 저장소의 `.gitignore` 적용 대상이 아니므로 다른 저장소에도 결과를 추가하지 마세요.
+7. 공유 전에는 **모든 출력 지우기** 후 저장하세요. 입력한 SQL·값 자체도 민감정보가 없는지 별도로 확인합니다.
+
+`notebook` 추가 의존성을 설치하지 않으면 `.xlsx` 저장에 필요한 `openpyxl`이 없을 수 있습니다.
+접속 또는 TLS 설정 변경 후에는 커널을 재시작하세요. `HHHS_QUERY_TIMEOUT`, `HHHS_MAX_ROWS`,
+`HHHS_SCHEMA` 등의 동작 설정은 **import 전에 프로세스 환경변수로 설정**해야 합니다.
+현재 `.env` 로딩은 첫 연결 시 접속정보를 읽는 용도이므로 `.env`에 동작 설정을 추가하는 것만으로 적용되지 않습니다.
+`HHHS_ENV_FILE`을 명시했는데 파일이 없으면 다른 `.env`로 넘어가지 않고 오류를 냅니다.
+
 ### 파이썬 (노트북)
 
 ```python
@@ -158,7 +189,7 @@ hhhs-db --csv table SA_SOH -n 1000 > 수주_1000건.csv
 
 ## 파이썬 API
 
-모든 함수는 `pandas.DataFrame` 을 돌려주고, 실패하면 `DBError` 계열 예외를 냅니다.
+조회 함수는 `pandas.DataFrame` 을 돌려주고 (`check`는 dict),, 실패하면 `DBError` 계열 예외를 냅니다.
 
 ### `get_list_tables(like=None, *, min_rows=None, schema=None, refresh=False)`
 
@@ -171,21 +202,22 @@ hhhs-db --csv table SA_SOH -n 1000 > 수주_1000건.csv
 | `schema` | `"NEOE"` 처럼 스키마 제한 |
 | `refresh` | 서버에서 다시 읽음. 목록은 프로세스 안에서 한 번만 읽고 재사용 |
 
-행수는 서버 통계(`sys.partitions`)라 테이블을 읽지 않고 즉시 나오며, 정확한 `COUNT(*)` 와 소수점 이하 차이가 날 수 있습니다.
+행수는 서버 통계(`sys.partitions`)라 테이블을 읽지 않고 즉시 나오며, 정확한 `COUNT(*)` 와 차이가 날 수 있습니다. 일반 뷰의 행수는 NULL일 수 있어 `min_rows=1` 검색에서는 숨겨집니다.
 
 ### `get_columns(table_name)`
 
 컬럼 목록. 열: `column, name_kr, type, nullable, pk`. `pk` 는 기본키 안의 순서(없으면 빈 값).
 `name_kr` 은 ERP 안의 사전 테이블(`CM_DICTION`)에서 붙이며, 사전에 없는 컬럼은 비어 있습니다.
 
-### `get_table(table_name, limit=100, *, columns=None, where=None, order_by=None, **params)`
+### `get_table(table_name, limit=100, *, columns=None, where=None, order_by=None, max_rows=None, **params)`
 
 `SELECT TOP {limit} {columns} FROM {table} WHERE {where} ORDER BY {order_by}` 를 만들어 실행합니다.
 
 | 인자 | 설명 |
 | --- | --- |
 | `table_name` | `"SA_SOH"` 또는 `"NEOE.SA_SOH"`. 스키마를 생략하면 `NEOE` |
-| `limit` | 기본 100. `None` 이면 TOP 없음 — 큰 테이블은 `where` 가 없으면 거부됩니다 |
+| `limit` | 양의 정수, 기본 100. `None` 이면 TOP 없음. Python에서 0·음수는 거부합니다 (CLI `-n 0`은 TOP 없음으로 변환) |
+| `max_rows` | 수신 상한. 기본 10,000이며 `limit`을 크게 해도 자동으로 증가하지 않습니다 |
 | `columns` | 컬럼 이름 목록. 생략하면 `*` |
 | `where` | SQL 조건문. 값은 `:이름` 으로 쓰고 키워드 인자로 넘깁니다 |
 | `order_by` | `"DT_SO DESC"` 처럼. 컬럼명과 ASC/DESC 만 허용 |
@@ -194,7 +226,7 @@ hhhs-db --csv table SA_SOH -n 1000 > 수주_1000건.csv
 get_table("MA_ITEM", 10, columns=["CD_ITEM", "NM_ITEM"], where="NM_ITEM LIKE :kw", kw="%POLY%")
 ```
 
-### `query(sql, params=None, *, max_rows=None, allow_heavy=False, **params)`
+### `query(sql, params=None, *, max_rows=None, allow_heavy=False, **kw)`
 
 SELECT 를 그대로 실행합니다. 값은 `:이름` 바인딩으로 — 문자열을 f-string 으로 붙이지 마세요.
 
@@ -245,18 +277,18 @@ hhhs-db [--csv] [--max-rows N] [-v] <명령> ...
 
 | 장치 | 동작 | 조정 |
 | --- | --- | --- |
-| SELECT 만 실행 | `SELECT` / `WITH` 로 시작하지 않는 문장은 서버로 보내지 않음 | — |
-| 결과 행 상한 | 상한 + 1행까지만 받고 연결의 나머지 결과를 버림 → 서버가 더 보내지 않음. 잘리면 경고 | `HHHS_MAX_ROWS` (기본 10,000, 0 = 무제한), `max_rows=` |
+| 조회 구문 보조 검사 | SELECT/WITH 시작 검사, 다중 문장·쓰기 키워드·SELECT INTO·외부 데이터 접근 구문 차단 (문자열·주석 제외). 완전한 SQL 파서나 보안 경계는 아님 | 최종 보장은 SELECT 전용 서버 계정 |
+| 결과 행 상한 | 상한 + 1행까지만 받아 DataFrame을 자르고 결과를 닫음. 드라이버 버퍼링·서버 스캔량까지 제한하지는 않음. 잘리면 경고 | `HHHS_MAX_ROWS` (기본 10,000, 0 = 무제한), `max_rows=` |
 | 쿼리 제한시간 | 서버에서 실행 중인 쿼리를 중단. 재시도하지 않음(무거운 쿼리를 반복하지 않기 위해) | `HHHS_QUERY_TIMEOUT` (기본 60초) |
 | 큰 테이블 보호 | 100만 행 이상 테이블을 `TOP` · `WHERE` · 집계 · `GROUP BY` 없이 읽는 SQL 은 실행 전 거부 | `HHHS_HEAVY_ROWS`, `allow_heavy=True` |
 | 동시 실행 1개 | 프로세스 안에서 쿼리는 한 번에 하나(잠금). 서버 연결도 1개(풀 크기 1) | — |
 | 응답 적응 휴지 | 직전 쿼리가 오래 걸렸으면 그 시간의 20%(최대 5초)를 쉬고 다음 쿼리를 시작. 연속 호출 최소 간격 0.1초 | `HHHS_COOLDOWN=0` 으로 끔 |
-| 잠금 회피 | 세션을 `READ UNCOMMITTED` 로 열어 ERP 사용자의 입력 트랜잭션을 기다리거나 막지 않음. `LOCK_TIMEOUT 5초` | — |
+| 잠금 회피 | 세션을 `READ UNCOMMITTED` 로 열어 데이터 잠금 경합을 줄임. 스키마 잠금 등은 여전히 발생 가능. `LOCK_TIMEOUT 5초` | — |
 | 카탈로그 캐시 | 테이블 목록은 프로세스당 한 번만 읽음. 큰 테이블 판정도 이 캐시로 | `get_list_tables(refresh=True)` |
 | 일시 오류 재시도 | 연결 끊김(20006 · 20047 · 20009)만 2초 뒤 한 번 재시도. 타임아웃 · 권한 오류는 재시도하지 않음 | — |
 | 세션 식별 | 서버 세션 목록에 `hhhs_db_manager/버전` 으로 표시되어 DBA 가 이 도구의 쿼리를 구분할 수 있음 | — |
 
-`READ UNCOMMITTED` 는 커밋되지 않은 행을 읽을 수 있다는 뜻입니다. 실무자가 입력 중인 전표가 집계에 섞일 수 있으므로, 마감 수치를 확정할 때는 기준일을 하루 전으로 잡으세요.
+`READ UNCOMMITTED` 는 커밋되지 않은 행을 읽을 수 있다는 뜻입니다. 실무자가 입력 중인 전표가 집계에 섞이거나 행이 누락·중복될 수 있습니다. 날짜를 하루 전으로 잡아도 일관성이 보장되지는 않습니다. 마감 수치는 DBA가 승인한 일관성 있는 조회 환경에서 별도 검산하세요.
 
 ---
 
@@ -330,9 +362,13 @@ cp .env.example .env            # 값 채우기
 hhhs-db check                   # 접속 · 권한 · 설정
 ```
 
-- 코드는 `hhhs_db_manager.py` 한 파일, 사람용 예시는 `hhhs_db_manager.ipynb` 입니다. 접속 → `query()` 한 곳을 모든 조회가 지나가므로 부하 장치는 거기에만 있습니다.
+- 코드는 `hhhs_db_manager.py` 한 파일, 사람용 예시는 `hhhs_db_manager.ipynb` 입니다. 공개 조회 함수는 `query()`를 거치므로 부하 장치는 거기에만 있습니다.
 - `db.py` 는 이전 이름으로 부르던 스크립트를 위한 호환 파일입니다. 새 코드에서는 쓰지 마세요.
 - TLS 설정(`openssl-legacy.cnf`)은 모듈 안에 내장되어 첫 실행 때 `~/.cache/hhhs_db_manager/` 에 풀립니다. 서버 인증서가 갱신되면 이 부분을 지우면 됩니다.
-- 변경 후에는 `hhhs-db check`, `hhhs-db tables SO`, `hhhs-db table SA_SOH -n 3` 세 가지가 돌아가는지 확인하고 커밋합니다.
+- 먼저 DB 연결 없이 회귀 테스트를 실행합니다: `uv run python3 -m unittest -v`.
+- 테스트는 SQL 보조 검사, 입력 건수, 수신 상한, 사전 조회 실패, CLI 상한, 노트북 구문·출력·입력 도우미를 검증하며 `.env`를 읽지 않습니다.
+- 실제 접속 검증은 승인된 환경에서 `hhhs-db check`, `hhhs-db tables SO`, `hhhs-db table SA_SOH -n 3`으로 별도 수행합니다. 오프라인 테스트 통과가 운영 DB·TLS 연결 성공을 의미하지는 않습니다.
+- 서버 오류의 원문은 자격증명·호스트 노출 방지를 위해 일반 오류와 재시도 로그에서 표시하지 않습니다.
+- `engine()`은 저수준 SQLAlchemy 연결이므로 직접 사용하면 `query()`의 보조 검사를 거치지 않습니다. 노트북에서는 공개 조회 함수를 사용하세요.
 
 이 저장소는 유진 AI CoE 팀 내부용입니다. 별도 라이선스 표기가 없으며 회사 외부 이용을 허용하지 않습니다.
